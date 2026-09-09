@@ -10,9 +10,17 @@ RUN cargo build --release
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates docker-compose-plugin docker.io \
+        ca-certificates docker.io \
         build-essential procps curl file git sudo \
     && rm -rf /var/lib/apt/lists/*
+
+# docker-compose-plugin isn't in Debian's default apt repos (only via
+# Docker's own apt repo, which we're not adding here) — install the
+# CLI plugin binary directly instead.
+RUN mkdir -p /usr/local/lib/docker/cli-plugins && \
+    curl -SL https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64 \
+    -o /usr/local/lib/docker/cli-plugins/docker-compose && \
+    chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
 
 # Homebrew refuses to run as root — dedicated non-root user owns the
 # Homebrew install and runs anvil; the agent binary itself still runs
