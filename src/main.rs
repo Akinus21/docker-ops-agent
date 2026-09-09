@@ -227,7 +227,7 @@ async fn execute_tool(call: ToolCall) -> ToolResult {
     match call.name.as_str() {
         // anvil_docker_update { "service": "mcp-proxy", "wait_seconds": 15 }
         "anvil_docker_update" => {
-            let Some(service) = call.arguments.get("service").and_then(|v| v.as_str()) else {            let Some(service) = call.arguments.get("service").and_then(|v| v.as_str()) else {
+            let Some(service) = call.arguments.get("service").and_then(|v| v.as_str()) else {
                 return ToolResult { ok: false, output: "missing `service` argument".into() };
             };
             if !valid_name(service) {
@@ -457,7 +457,7 @@ async fn handle_mesh_call(state: &AppState, params: Value) -> Result<Value, Stri
             call.host_label
                 .as_ref()
                 .map(|h| &p.host_label == h)
-                .unwrap_or(true)                .unwrap_or(true)
+                .unwrap_or(true)
                 && call.role.as_ref().map(|r| &p.role == r).unwrap_or(true)
         })
         .collect();
