@@ -137,6 +137,48 @@ static TOOL_DEFS: &[ToolDef] = &[
         tags: &["docker", "debug"],
         requires_binary: "docker",
     },
+    ToolDef {
+        id: "docker_inspect",
+        name: "Docker Inspect",
+        description: "Full inspect output for a named container (config, mounts, network, state). Arguments: container (string, required).",
+        tags: &["docker", "debug"],
+        requires_binary: "docker",
+    },
+    ToolDef {
+        id: "docker_stats",
+        name: "Docker Stats",
+        description: "Point-in-time resource usage (CPU, memory, network, block I/O) for one container, or all running containers if none is given. Arguments: container (string, optional).",
+        tags: &["docker", "debug", "monitoring"],
+        requires_binary: "docker",
+    },
+    ToolDef {
+        id: "docker_prune",
+        name: "Docker Prune",
+        description: "Remove unused Docker objects to reclaim disk space. Arguments: scope (string, required — one of \"containers\", \"images\", \"volumes\", \"builder\", \"system\"), all (boolean, optional, only affects scope \"images\" — false/omitted removes only dangling images (safe default), true removes every unused image (aggressive)).",
+        tags: &["docker", "maintenance"],
+        requires_binary: "docker",
+    },
+    ToolDef {
+        id: "docker_start",
+        name: "Docker Start",
+        description: "Start a stopped container by name. Arguments: container (string, required).",
+        tags: &["docker", "lifecycle"],
+        requires_binary: "docker",
+    },
+    ToolDef {
+        id: "docker_stop",
+        name: "Docker Stop",
+        description: "Stop a running container by name (graceful, with default timeout). Arguments: container (string, required).",
+        tags: &["docker", "lifecycle"],
+        requires_binary: "docker",
+    },
+    ToolDef {
+        id: "docker_restart",
+        name: "Docker Restart",
+        description: "Restart a container by name directly (works regardless of which compose stack it belongs to, unlike compose_restart). Arguments: container (string, required).",
+        tags: &["docker", "lifecycle"],
+        requires_binary: "docker",
+    },
     // Add new tools here as ToolDef entries. Pick whatever binary the
     // tool genuinely depends on for `requires_binary` — if that binary
     // isn't installed on a given host (no matching line in that host's
@@ -281,6 +323,106 @@ async fn execute_tool(call: ToolCall) -> ToolResult {
             run_command("docker", &["ps", "--format", "{{.Names}}\t{{.Status}}"]).await
         }
 
+        // docker_inspect { "container": "hermes" }
+        "docker_inspect" => {
+            let Some(container) = call.arguments.get("container").and_then(|v| v.as_str()) else {
+                return ToolResult { ok: false, output: "missing `container` argument".into() };
+            };
+            if !valid_name(container) {
+                return ToolResult { ok: false, output: "invalid `container` name".into() };
+            }
+            run_command("docker", &["inspect", container]).await
+        }
+
+        // docker_stats { "container": "hermes" }  (container is optional — omit for all)
+        "docker_stats" => {
+            let container = call.arguments.get("container").and_then(|v| v.as_str());
+            if let Some(c) = container {
+                if !valid_name(c) {
+                    return ToolResult { ok: false, output: "invalid `container` name".into() };
+                }
+                run_command(
+                    "docker",
+                    &["stats", "--no-stream", "--format", "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.NetIO}}\t{{.BlockIO}}", c],
+                )
+                .await
+            } else {
+                run_command(
+                    "docker",
+                    &["stats", "--no-stream", "--format", "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.NetIO}}\t{{.BlockIO}}"],
+                )
+                .await
+            }
+        }
+
+        // docker_prune { "scope": "images", "all": false }
+        // "all" only applies to scope "images": false/omitted removes only
+        // dangling images (safe default); true removes every image not
+        // used by a running container (aggressive — needs explicit opt-in).
+        "docker_prune" => {
+            let Some(scope) = call.arguments.get("scope").and_then(|v| v.as_str()) else {
+                return ToolResult {
+                    ok: false,
+                    output: "missing `scope` argument — one of: containers, images, volumes, builder, system".into(),
+                };
+            };
+            let remove_all_images = call
+                .arguments
+                .get("all")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let subcommand: &[&str] = match scope {
+                "containers" => &["container", "prune", "-f"],
+                "images" if remove_all_images => &["image", "prune", "-af"],
+                "images" => &["image", "prune", "-f"],
+                "volumes" => &["volume", "prune", "-f"],
+                "builder" => &["builder", "prune", "-f"],
+                "system" => &["system", "prune", "-f"],
+                other => {
+                    return ToolResult {
+                        ok: false,
+                        output: format!(
+                            "invalid `scope` \"{other}\" — one of: containers, images, volumes, builder, system"
+                        ),
+                    };
+                }
+            };
+            run_command("docker", subcommand).await
+        }
+
+        // docker_start { "container": "hermes" }
+        "docker_start" => {
+            let Some(container) = call.arguments.get("container").and_then(|v| v.as_str()) else {
+                return ToolResult { ok: false, output: "missing `container` argument".into() };
+            };
+            if !valid_name(container) {
+                return ToolResult { ok: false, output: "invalid `container` name".into() };
+            }
+            run_command("docker", &["start", container]).await
+        }
+
+        // docker_stop { "container": "hermes" }
+        "docker_stop" => {
+            let Some(container) = call.arguments.get("container").and_then(|v| v.as_str()) else {
+                return ToolResult { ok: false, output: "missing `container` argument".into() };
+            };
+            if !valid_name(container) {
+                return ToolResult { ok: false, output: "invalid `container` name".into() };
+            }
+            run_command("docker", &["stop", container]).await
+        }
+
+        // docker_restart { "container": "hermes" }
+        "docker_restart" => {
+            let Some(container) = call.arguments.get("container").and_then(|v| v.as_str()) else {
+                return ToolResult { ok: false, output: "missing `container` argument".into() };
+            };
+            if !valid_name(container) {
+                return ToolResult { ok: false, output: "invalid `container` name".into() };
+            }
+            run_command("docker", &["restart", container]).await
+        }
+
         // Every id in TOOL_DEFS must have a matching arm above; this is
         // unreachable because execute_tool already looked the name up
         // in TOOL_DEFS before we get here.
@@ -403,7 +545,7 @@ async fn call_peer(
             "message": {
                 "role": "user",
                 "parts": [
-                    { "type": "data", "data": { "name": tool_name, "arguments": arguments } }
+                    { "kind": "data", "data": { "name": tool_name, "arguments": arguments } }
                 ]
             }
         }
@@ -501,12 +643,15 @@ async fn handle_mesh_call(state: &AppState, params: Value) -> Result<Value, Stri
 
 #[derive(Debug, Deserialize)]
 struct MessagePart {
-    #[serde(rename = "type")]
-    part_type: String,
+    // The real A2A spec uses "kind" as the Part discriminator field,
+    // not "type" — this was wrong in the first pass at this agent and
+    // is why a spec-compliant client (Hermes, using a real A2A SDK)
+    // rejected the old shape outright.
+    #[serde(rename = "kind")]
+    part_kind: String,
     #[serde(default)]
     data: Option<Value>,
     #[serde(default)]
-    #[allow(dead_code)]
     text: Option<String>,
 }
 
@@ -525,23 +670,44 @@ struct SendMessageParams {
     message: A2aMessage,
 }
 
-/// Extract a tool call ({"name":..., "arguments":...}) from the first
-/// data part of an incoming message. Text parts aren't accepted as
-/// tool invocations — this agent's skills are structured operations,
-/// not natural-language commands.
+/// Extract a tool call from an incoming message. Accepts two shapes,
+/// since real A2A clients (Hermes included) naturally send plain text
+/// rather than our internal structured format:
+///   - a "data" part: {"kind":"data","data":{"name":"...","arguments":{...}}}
+///   - a "text" part, which is parsed as either:
+///       - a bare tool id with no arguments, e.g. "docker_ps"
+///       - a JSON object string, e.g. {"name":"...","arguments":{...}}
 fn tool_call_from_message(msg: &A2aMessage) -> Result<ToolCall, String> {
-    let data_part = msg
-        .parts
-        .iter()
-        .find(|p| p.part_type == "data")
-        .ok_or_else(|| {
-            "message must contain a data part shaped like {\"name\": \"<tool>\", \"arguments\": {...}}".to_string()
-        })?;
-    let data = data_part
-        .data
-        .clone()
-        .ok_or_else(|| "data part is missing its `data` field".to_string())?;
-    serde_json::from_value(data).map_err(|e| format!("invalid tool call shape: {e}"))
+    if let Some(data_part) = msg.parts.iter().find(|p| p.part_kind == "data") {
+        let data = data_part
+            .data
+            .clone()
+            .ok_or_else(|| "data part is missing its `data` field".to_string())?;
+        return serde_json::from_value(data).map_err(|e| format!("invalid tool call shape: {e}"));
+    }
+
+    if let Some(text_part) = msg.parts.iter().find(|p| p.part_kind == "text") {
+        let text = text_part
+            .text
+            .as_deref()
+            .unwrap_or("")
+            .trim();
+        if text.is_empty() {
+            return Err("text part is empty".to_string());
+        }
+        // Try structured JSON first (e.g. {"name":"docker_logs","arguments":{"container":"hermes"}})
+        if text.starts_with('{') {
+            return serde_json::from_str(text)
+                .map_err(|e| format!("text part looked like JSON but failed to parse: {e}"));
+        }
+        // Otherwise treat the whole text as a bare tool id with no arguments.
+        return Ok(ToolCall {
+            name: text.to_string(),
+            arguments: json!({}),
+        });
+    }
+
+    Err("message must contain a \"data\" part ({\"name\":..., \"arguments\":...}) or a \"text\" part (a tool id, optionally as a JSON object with arguments)".to_string())
 }
 
 fn build_task_response(context_id: Option<String>, result: &ToolResult) -> Value {
@@ -563,7 +729,7 @@ fn build_task_response(context_id: Option<String>, result: &ToolResult) -> Value
                 "name": "result",
                 "parts": [
                     {
-                        "type": "data",
+                        "kind": "data",
                         "data": { "ok": result.ok, "output": result.output }
                     }
                 ]
