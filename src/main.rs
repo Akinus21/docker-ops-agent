@@ -317,8 +317,8 @@ async fn agent_card() -> Json<Value> {
 
     Json(json!({
         "name": format!("docker-ops-agent ({host})"),
-        "description": "Host Docker/Anvil operations exposed as a narrow, allowlisted A2A tool surface, scoped to whatever tooling is actually installed on this host. Does not grant raw shell or docker-socket access to callers — every operation is a named, validated function.",
-        "version": "0.2.0",
+        "description": "Host Docker/Anvil operations exposed as a narrow, allowlisted A2A tool surface, scoped to whatever tooling is actually installed on this host. Does not grant raw shell or docker-socket access to callers — every operation is a named, validated function. Invoke via message/send with a single data part shaped like {\"name\": \"<skill id>\", \"arguments\": {...}} — see the skills array below for valid ids and their arguments. Responds with a standard Task object; the result is in artifacts[0].parts[0].data as {\"ok\": bool, \"output\": string}.",
+        "version": "0.3.0",
         "hostLabel": host,
         "supportedInterfaces": [
             { "url": self_rpc_base, "protocolBinding": "JSONRPC", "protocolVersion": "1.0" }
@@ -398,8 +398,15 @@ async fn call_peer(
     let payload = json!({
         "jsonrpc": "2.0",
         "id": 1,
-        "method": "tools/call",
-        "params": { "name": tool_name, "arguments": arguments }
+        "method": "message/send",
+        "params": {
+            "message": {
+                "role": "user",
+                "parts": [
+                    { "type": "data", "data": { "name": tool_name, "arguments": arguments } }
+                ]
+            }
+        }
     })
     .to_string();
 
@@ -477,6 +484,103 @@ async fn handle_mesh_call(state: &AppState, params: Value) -> Result<Value, Stri
     call_peer(&rpc_base, &mesh_token, &call.tool_name, call.arguments).await
 }
 
+// ---------------------------------------------------------------------
+// Real A2A message/send support
+// ---------------------------------------------------------------------
+//
+// The A2A spec's core invocation method is message/send, not a custom
+// tools/call RPC. This agent maps that properly: a Message carries a
+// "data" part shaped like { "name": "<tool>", "arguments": {...} } —
+// the same shape as before, just wrapped in a spec-correct envelope —
+// and the response is a real Task object with a status and an
+// artifact containing the tool's output as a data part.
+//
+// tools/call is kept as a deprecated alias (identical underlying
+// execution) so peers mid-rollout that still send the old shape don't
+// break — remove it once every host in the mesh is on this version.
+
+#[derive(Debug, Deserialize)]
+struct MessagePart {
+    #[serde(rename = "type")]
+    part_type: String,
+    #[serde(default)]
+    data: Option<Value>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    text: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct A2aMessage {
+    #[serde(default)]
+    #[allow(dead_code)]
+    role: Option<String>,
+    parts: Vec<MessagePart>,
+    #[serde(rename = "contextId", default)]
+    context_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SendMessageParams {
+    message: A2aMessage,
+}
+
+/// Extract a tool call ({"name":..., "arguments":...}) from the first
+/// data part of an incoming message. Text parts aren't accepted as
+/// tool invocations — this agent's skills are structured operations,
+/// not natural-language commands.
+fn tool_call_from_message(msg: &A2aMessage) -> Result<ToolCall, String> {
+    let data_part = msg
+        .parts
+        .iter()
+        .find(|p| p.part_type == "data")
+        .ok_or_else(|| {
+            "message must contain a data part shaped like {\"name\": \"<tool>\", \"arguments\": {...}}".to_string()
+        })?;
+    let data = data_part
+        .data
+        .clone()
+        .ok_or_else(|| "data part is missing its `data` field".to_string())?;
+    serde_json::from_value(data).map_err(|e| format!("invalid tool call shape: {e}"))
+}
+
+fn build_task_response(context_id: Option<String>, result: &ToolResult) -> Value {
+    let task_id = uuid::Uuid::new_v4().to_string();
+    let context_id = context_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let now = chrono::Utc::now().to_rfc3339();
+    let state = if result.ok { "completed" } else { "failed" };
+
+    json!({
+        "id": task_id,
+        "contextId": context_id,
+        "status": {
+            "state": state,
+            "timestamp": now
+        },
+        "artifacts": [
+            {
+                "artifactId": uuid::Uuid::new_v4().to_string(),
+                "name": "result",
+                "parts": [
+                    {
+                        "type": "data",
+                        "data": { "ok": result.ok, "output": result.output }
+                    }
+                ]
+            }
+        ]
+    })
+}
+
+async fn handle_message_send(params: Value) -> Result<Value, String> {
+    let send_params: SendMessageParams =
+        serde_json::from_value(params).map_err(|e| format!("invalid message/send params: {e}"))?;
+    let call = tool_call_from_message(&send_params.message)?;
+    let context_id = send_params.message.context_id.clone();
+    let result = execute_tool(call).await;
+    Ok(build_task_response(context_id, &result))
+}
+
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
     #[allow(dead_code)]
@@ -528,7 +632,15 @@ async fn rpc_handler(
     };
 
     match req.method.as_str() {
-        // Single dispatch method: { "method": "tools/call", "params": { "name": "...", "arguments": {...} } }
+        // The real A2A invocation method. See the "Real A2A message/send
+        // support" section above for the Message -> Task mapping.
+        "message/send" => match handle_message_send(req.params).await {
+            Ok(task) => (StatusCode::OK, jsonrpc_result(req.id, task)).into_response(),
+            Err(e) => (StatusCode::OK, jsonrpc_error(req.id, -32602, &e)).into_response(),
+        },
+        // DEPRECATED: pre-A2A-compliance shape, kept only so peers still
+        // running an older build of this agent don't break mid-rollout.
+        // Remove once every host in the mesh is confirmed updated.
         "tools/call" => {
             let call: ToolCall = match serde_json::from_value(req.params) {
                 Ok(c) => c,
