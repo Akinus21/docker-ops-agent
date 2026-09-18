@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{env, sync::Arc};
 use tokio::process::Command;
+use uuid::Uuid;
 
 // ---------------------------------------------------------------------
 // Config / auth
@@ -138,45 +139,31 @@ static TOOL_DEFS: &[ToolDef] = &[
         requires_binary: "docker",
     },
     ToolDef {
-        id: "docker_inspect",
-        name: "Docker Inspect",
-        description: "Full inspect output for a named container (config, mounts, network, state). Arguments: container (string, required).",
-        tags: &["docker", "debug"],
+        id: "network_diagnose",
+        name: "Network Diagnose",
+        description: "Diagnose DNS/connectivity for a hostname reachable from this host — runs getent hosts + docker network inspect against the target's container network. Arguments: target (string, required — a hostname or container name).",
+        tags: &["network", "debug"],
         requires_binary: "docker",
     },
     ToolDef {
-        id: "docker_stats",
-        name: "Docker Stats",
-        description: "Point-in-time resource usage (CPU, memory, network, block I/O) for one container, or all running containers if none is given. Arguments: container (string, optional).",
-        tags: &["docker", "debug", "monitoring"],
+        id: "caddy_config_read",
+        name: "Caddy Config Read",
+        description: "Read the live Caddyfile from the caddy container. No arguments.",
+        tags: &["caddy", "config", "debug"],
         requires_binary: "docker",
     },
     ToolDef {
-        id: "docker_prune",
-        name: "Docker Prune",
-        description: "Remove unused Docker objects to reclaim disk space. Arguments: scope (string, required — one of \"containers\", \"images\", \"volumes\", \"builder\", \"system\"), all (boolean, optional, only affects scope \"images\" — false/omitted removes only dangling images (safe default), true removes every unused image (aggressive)).",
-        tags: &["docker", "maintenance"],
+        id: "caddy_config_propose",
+        name: "Caddy Config Propose",
+        description: "Stage a proposed full replacement of the Caddyfile without applying it. Returns a proposal_id and shows current vs proposed content side by side for review. Does NOT touch the live config. Arguments: proposed_content (string, required).",
+        tags: &["caddy", "config", "propose"],
         requires_binary: "docker",
     },
     ToolDef {
-        id: "docker_start",
-        name: "Docker Start",
-        description: "Start a stopped container by name. Arguments: container (string, required).",
-        tags: &["docker", "lifecycle"],
-        requires_binary: "docker",
-    },
-    ToolDef {
-        id: "docker_stop",
-        name: "Docker Stop",
-        description: "Stop a running container by name (graceful, with default timeout). Arguments: container (string, required).",
-        tags: &["docker", "lifecycle"],
-        requires_binary: "docker",
-    },
-    ToolDef {
-        id: "docker_restart",
-        name: "Docker Restart",
-        description: "Restart a container by name directly (works regardless of which compose stack it belongs to, unlike compose_restart). Arguments: container (string, required).",
-        tags: &["docker", "lifecycle"],
+        id: "caddy_config_apply",
+        name: "Caddy Config Apply",
+        description: "Apply a previously staged proposal (from caddy_config_propose) and reload Caddy. Only works with a valid, still-pending proposal_id — cannot apply arbitrary content directly. Arguments: proposal_id (string, required).",
+        tags: &["caddy", "config", "apply"],
         requires_binary: "docker",
     },
     // Add new tools here as ToolDef entries. Pick whatever binary the
@@ -188,6 +175,16 @@ static TOOL_DEFS: &[ToolDef] = &[
 
 /// Binaries found on $PATH at startup, checked once via `which`.
 static AVAILABLE_BINARIES: Lazy<std::collections::HashSet<String>> = Lazy::new(detect_binaries);
+
+// In-memory store for staged-but-not-yet-applied Caddy config changes.
+// A proposal must exist here before caddy_config_apply will act on it —
+// this is what stops a single tool call from directly mutating a live
+// service config; the change has to be visible (via caddy_config_propose's
+// output) before anything gets applied. Proposals don't survive a
+// container restart, which is intentional — a stale half-approved change
+// shouldn't silently resurrect itself.
+static PENDING_CADDY_PROPOSALS: Lazy<std::sync::Mutex<std::collections::HashMap<String, String>>> =
+    Lazy::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 fn detect_binaries() -> std::collections::HashSet<String> {
     let mut found = std::collections::HashSet::new();
@@ -245,6 +242,19 @@ async fn run_command(program: &str, args: &[&str]) -> ToolResult {
         },
     }
 }
+
+// Path to the compose file this agent is allowed to operate against.
+// Bake this in at build time or override via env if you run multiple
+// stacks; kept as a constant here to avoid the agent ever being told
+// an arbitrary compose file path at call time.
+const COMPOSE_FILE: &str = "/stack/compose.yaml";
+
+// Caddy container name + config path this agent is allowed to read/write.
+// Verify these match your actual Services host setup before trusting
+// caddy_config_apply with anything real (e.g. `docker exec caddy which caddy`,
+// `docker exec caddy cat <path>`).
+const CADDY_CONTAINER: &str = "caddy";
+const CADDY_CONFIG_PATH: &str = "/etc/caddy/Caddyfile";
 
 async fn execute_tool(call: ToolCall) -> ToolResult {
     let Some(def) = TOOL_DEFS.iter().find(|t| t.id == call.name) else {
@@ -323,104 +333,139 @@ async fn execute_tool(call: ToolCall) -> ToolResult {
             run_command("docker", &["ps", "--format", "{{.Names}}\t{{.Status}}"]).await
         }
 
-        // docker_inspect { "container": "hermes" }
-        "docker_inspect" => {
-            let Some(container) = call.arguments.get("container").and_then(|v| v.as_str()) else {
-                return ToolResult { ok: false, output: "missing `container` argument".into() };
+        // network_diagnose { "target": "opencode-a2a" }
+        "network_diagnose" => {
+            let Some(target) = call.arguments.get("target").and_then(|v| v.as_str()) else {
+                return ToolResult { ok: false, output: "missing `target` argument".into() };
             };
-            if !valid_name(container) {
-                return ToolResult { ok: false, output: "invalid `container` name".into() };
+            if !valid_name(target) {
+                return ToolResult { ok: false, output: "invalid `target` name".into() };
             }
-            run_command("docker", &["inspect", container]).await
-        }
 
-        // docker_stats { "container": "hermes" }  (container is optional — omit for all)
-        "docker_stats" => {
-            let container = call.arguments.get("container").and_then(|v| v.as_str());
-            if let Some(c) = container {
-                if !valid_name(c) {
-                    return ToolResult { ok: false, output: "invalid `container` name".into() };
-                }
-                run_command(
-                    "docker",
-                    &["stats", "--no-stream", "--format", "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.NetIO}}\t{{.BlockIO}}", c],
-                )
-                .await
-            } else {
-                run_command(
-                    "docker",
-                    &["stats", "--no-stream", "--format", "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.NetIO}}\t{{.BlockIO}}"],
-                )
-                .await
+            let dns = run_command("getent", &["hosts", target]).await;
+            let net = run_command(
+                "docker",
+                &["network", "inspect", "bridge", "--format", "{{json .Containers}}"],
+            )
+            .await;
+
+            ToolResult {
+                ok: dns.ok || net.ok,
+                output: format!(
+                    "--- getent hosts {target} ---\n{}\n--- docker network inspect (bridge) ---\n{}",
+                    dns.output, net.output
+                ),
             }
         }
 
-        // docker_prune { "scope": "images", "all": false }
-        // "all" only applies to scope "images": false/omitted removes only
-        // dangling images (safe default); true removes every image not
-        // used by a running container (aggressive — needs explicit opt-in).
-        "docker_prune" => {
-            let Some(scope) = call.arguments.get("scope").and_then(|v| v.as_str()) else {
+        // caddy_config_read {}
+        "caddy_config_read" => {
+            run_command("docker", &["exec", CADDY_CONTAINER, "cat", CADDY_CONFIG_PATH]).await
+        }
+
+        // caddy_config_propose { "proposed_content": "..." }
+        "caddy_config_propose" => {
+            let Some(proposed) = call.arguments.get("proposed_content").and_then(|v| v.as_str()) else {
+                return ToolResult { ok: false, output: "missing `proposed_content` argument".into() };
+            };
+
+            let current = run_command("docker", &["exec", CADDY_CONTAINER, "cat", CADDY_CONFIG_PATH]).await;
+            if !current.ok {
                 return ToolResult {
                     ok: false,
-                    output: "missing `scope` argument — one of: containers, images, volumes, builder, system".into(),
+                    output: format!("could not read current config to compare against: {}", current.output),
+                };
+            }
+
+            let proposal_id = Uuid::new_v4().to_string();
+            PENDING_CADDY_PROPOSALS
+                .lock()
+                .unwrap()
+                .insert(proposal_id.clone(), proposed.to_string());
+
+            ToolResult {
+                ok: true,
+                output: format!(
+                    "proposal_id: {proposal_id}\n\n--- CURRENT ---\n{}\n\n--- PROPOSED ---\n{}\n\nReview both, then call caddy_config_apply with this proposal_id to apply and reload.",
+                    current.output, proposed
+                ),
+            }
+        }
+
+        // caddy_config_apply { "proposal_id": "..." }
+        "caddy_config_apply" => {
+            let Some(proposal_id) = call.arguments.get("proposal_id").and_then(|v| v.as_str()) else {
+                return ToolResult { ok: false, output: "missing `proposal_id` argument".into() };
+            };
+
+            let content = {
+                let mut store = PENDING_CADDY_PROPOSALS.lock().unwrap();
+                store.remove(proposal_id)
+            };
+            let Some(content) = content else {
+                return ToolResult {
+                    ok: false,
+                    output: "no pending proposal with that id — call caddy_config_propose first".into(),
                 };
             };
-            let remove_all_images = call
-                .arguments
-                .get("all")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let subcommand: &[&str] = match scope {
-                "containers" => &["container", "prune", "-f"],
-                "images" if remove_all_images => &["image", "prune", "-af"],
-                "images" => &["image", "prune", "-f"],
-                "volumes" => &["volume", "prune", "-f"],
-                "builder" => &["builder", "prune", "-f"],
-                "system" => &["system", "prune", "-f"],
-                other => {
-                    return ToolResult {
-                        ok: false,
-                        output: format!(
-                            "invalid `scope` \"{other}\" — one of: containers, images, volumes, builder, system"
-                        ),
-                    };
+
+            // Write via a temp file inside the container, then move into
+            // place, so a failed write can't leave a half-written config.
+            let write = Command::new("docker")
+                .args(["exec", "-i", CADDY_CONTAINER, "sh", "-c",
+                       &format!("cat > {CADDY_CONFIG_PATH}.new")])
+                .stdin(std::process::Stdio::piped())
+                .spawn();
+
+            let write_result = match write {
+                Ok(mut child) => {
+                    use tokio::io::AsyncWriteExt;
+                    if let Some(mut stdin) = child.stdin.take() {
+                        let _ = stdin.write_all(content.as_bytes()).await;
+                    }
+                    child.wait_with_output().await
+                }
+                Err(e) => {
+                    return ToolResult { ok: false, output: format!("failed to write staged config: {e}") };
                 }
             };
-            run_command("docker", subcommand).await
-        }
 
-        // docker_start { "container": "hermes" }
-        "docker_start" => {
-            let Some(container) = call.arguments.get("container").and_then(|v| v.as_str()) else {
-                return ToolResult { ok: false, output: "missing `container` argument".into() };
-            };
-            if !valid_name(container) {
-                return ToolResult { ok: false, output: "invalid `container` name".into() };
+            match write_result {
+                Ok(out) if out.status.success() => {}
+                Ok(out) => {
+                    return ToolResult {
+                        ok: false,
+                        output: format!("staged write failed: {}", String::from_utf8_lossy(&out.stderr)),
+                    };
+                }
+                Err(e) => {
+                    return ToolResult { ok: false, output: format!("staged write failed: {e}") };
+                }
             }
-            run_command("docker", &["start", container]).await
-        }
 
-        // docker_stop { "container": "hermes" }
-        "docker_stop" => {
-            let Some(container) = call.arguments.get("container").and_then(|v| v.as_str()) else {
-                return ToolResult { ok: false, output: "missing `container` argument".into() };
-            };
-            if !valid_name(container) {
-                return ToolResult { ok: false, output: "invalid `container` name".into() };
+            let mv = run_command(
+                "docker",
+                &["exec", CADDY_CONTAINER, "mv", &format!("{CADDY_CONFIG_PATH}.new"), CADDY_CONFIG_PATH],
+            )
+            .await;
+            if !mv.ok {
+                return ToolResult { ok: false, output: format!("failed to move staged config into place: {}", mv.output) };
             }
-            run_command("docker", &["stop", container]).await
-        }
 
-        // docker_restart { "container": "hermes" }
-        "docker_restart" => {
-            let Some(container) = call.arguments.get("container").and_then(|v| v.as_str()) else {
-                return ToolResult { ok: false, output: "missing `container` argument".into() };
-            };
-            if !valid_name(container) {
-                return ToolResult { ok: false, output: "invalid `container` name".into() };
+            // Caddy's own `caddy reload` validates the config before
+            // swapping it in — if the proposed content is malformed,
+            // this fails and the old config keeps serving, rather than
+            // Caddy going down on a bad config.
+            let reload = run_command(
+                "docker",
+                &["exec", CADDY_CONTAINER, "caddy", "reload", "--config", CADDY_CONFIG_PATH],
+            )
+            .await;
+
+            ToolResult {
+                ok: reload.ok,
+                output: format!("config written and moved into place.\nreload output: {}", reload.output),
             }
-            run_command("docker", &["restart", container]).await
         }
 
         // Every id in TOOL_DEFS must have a matching arm above; this is
@@ -429,12 +474,6 @@ async fn execute_tool(call: ToolCall) -> ToolResult {
         _ => unreachable!("tool id {} present in TOOL_DEFS without an execution arm", call.name),
     }
 }
-
-// Path to the compose file this agent is allowed to operate against.
-// Bake this in at build time or override via env if you run multiple
-// stacks; kept as a constant here to avoid the agent ever being told
-// an arbitrary compose file path at call time.
-const COMPOSE_FILE: &str = "/stack/compose.yaml";
 
 // ---------------------------------------------------------------------
 // A2A surface: agent card + JSON-RPC endpoint
@@ -459,7 +498,7 @@ async fn agent_card() -> Json<Value> {
 
     Json(json!({
         "name": format!("docker-ops-agent ({host})"),
-        "description": "Host Docker/Anvil operations exposed as a narrow, allowlisted A2A tool surface, scoped to whatever tooling is actually installed on this host. Does not grant raw shell or docker-socket access to callers — every operation is a named, validated function. Invoke via message/send with a single data part shaped like {\"name\": \"<skill id>\", \"arguments\": {...}} — see the skills array below for valid ids and their arguments. Responds with a standard Task object; the result is in artifacts[0].parts[0].data as {\"ok\": bool, \"output\": string}.",
+        "description": "Host Docker/Anvil operations exposed as a narrow, allowlisted A2A tool surface, scoped to whatever tooling is actually installed on this host. Does not grant raw shell or docker-socket access to callers — every operation is a named, validated function.",
         "version": "0.3.0",
         "hostLabel": host,
         "supportedInterfaces": [
@@ -540,15 +579,8 @@ async fn call_peer(
     let payload = json!({
         "jsonrpc": "2.0",
         "id": 1,
-        "method": "message/send",
-        "params": {
-            "message": {
-                "role": "user",
-                "parts": [
-                    { "kind": "data", "data": { "name": tool_name, "arguments": arguments } }
-                ]
-            }
-        }
+        "method": "tools/call",
+        "params": { "name": tool_name, "arguments": arguments }
     })
     .to_string();
 
@@ -626,127 +658,6 @@ async fn handle_mesh_call(state: &AppState, params: Value) -> Result<Value, Stri
     call_peer(&rpc_base, &mesh_token, &call.tool_name, call.arguments).await
 }
 
-// ---------------------------------------------------------------------
-// Real A2A message/send support
-// ---------------------------------------------------------------------
-//
-// The A2A spec's core invocation method is message/send, not a custom
-// tools/call RPC. This agent maps that properly: a Message carries a
-// "data" part shaped like { "name": "<tool>", "arguments": {...} } —
-// the same shape as before, just wrapped in a spec-correct envelope —
-// and the response is a real Task object with a status and an
-// artifact containing the tool's output as a data part.
-//
-// tools/call is kept as a deprecated alias (identical underlying
-// execution) so peers mid-rollout that still send the old shape don't
-// break — remove it once every host in the mesh is on this version.
-
-#[derive(Debug, Deserialize)]
-struct MessagePart {
-    // The real A2A spec uses "kind" as the Part discriminator field,
-    // not "type" — this was wrong in the first pass at this agent and
-    // is why a spec-compliant client (Hermes, using a real A2A SDK)
-    // rejected the old shape outright.
-    #[serde(rename = "kind")]
-    part_kind: String,
-    #[serde(default)]
-    data: Option<Value>,
-    #[serde(default)]
-    text: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct A2aMessage {
-    #[serde(default)]
-    #[allow(dead_code)]
-    role: Option<String>,
-    parts: Vec<MessagePart>,
-    #[serde(rename = "contextId", default)]
-    context_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct SendMessageParams {
-    message: A2aMessage,
-}
-
-/// Extract a tool call from an incoming message. Accepts two shapes,
-/// since real A2A clients (Hermes included) naturally send plain text
-/// rather than our internal structured format:
-///   - a "data" part: {"kind":"data","data":{"name":"...","arguments":{...}}}
-///   - a "text" part, which is parsed as either:
-///       - a bare tool id with no arguments, e.g. "docker_ps"
-///       - a JSON object string, e.g. {"name":"...","arguments":{...}}
-fn tool_call_from_message(msg: &A2aMessage) -> Result<ToolCall, String> {
-    if let Some(data_part) = msg.parts.iter().find(|p| p.part_kind == "data") {
-        let data = data_part
-            .data
-            .clone()
-            .ok_or_else(|| "data part is missing its `data` field".to_string())?;
-        return serde_json::from_value(data).map_err(|e| format!("invalid tool call shape: {e}"));
-    }
-
-    if let Some(text_part) = msg.parts.iter().find(|p| p.part_kind == "text") {
-        let text = text_part
-            .text
-            .as_deref()
-            .unwrap_or("")
-            .trim();
-        if text.is_empty() {
-            return Err("text part is empty".to_string());
-        }
-        // Try structured JSON first (e.g. {"name":"docker_logs","arguments":{"container":"hermes"}})
-        if text.starts_with('{') {
-            return serde_json::from_str(text)
-                .map_err(|e| format!("text part looked like JSON but failed to parse: {e}"));
-        }
-        // Otherwise treat the whole text as a bare tool id with no arguments.
-        return Ok(ToolCall {
-            name: text.to_string(),
-            arguments: json!({}),
-        });
-    }
-
-    Err("message must contain a \"data\" part ({\"name\":..., \"arguments\":...}) or a \"text\" part (a tool id, optionally as a JSON object with arguments)".to_string())
-}
-
-fn build_task_response(context_id: Option<String>, result: &ToolResult) -> Value {
-    let task_id = uuid::Uuid::new_v4().to_string();
-    let context_id = context_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let now = chrono::Utc::now().to_rfc3339();
-    let state = if result.ok { "completed" } else { "failed" };
-
-    json!({
-        "id": task_id,
-        "contextId": context_id,
-        "status": {
-            "state": state,
-            "timestamp": now
-        },
-        "artifacts": [
-            {
-                "artifactId": uuid::Uuid::new_v4().to_string(),
-                "name": "result",
-                "parts": [
-                    {
-                        "kind": "data",
-                        "data": { "ok": result.ok, "output": result.output }
-                    }
-                ]
-            }
-        ]
-    })
-}
-
-async fn handle_message_send(params: Value) -> Result<Value, String> {
-    let send_params: SendMessageParams =
-        serde_json::from_value(params).map_err(|e| format!("invalid message/send params: {e}"))?;
-    let call = tool_call_from_message(&send_params.message)?;
-    let context_id = send_params.message.context_id.clone();
-    let result = execute_tool(call).await;
-    Ok(build_task_response(context_id, &result))
-}
-
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
     #[allow(dead_code)]
@@ -798,15 +709,7 @@ async fn rpc_handler(
     };
 
     match req.method.as_str() {
-        // The real A2A invocation method. See the "Real A2A message/send
-        // support" section above for the Message -> Task mapping.
-        "message/send" => match handle_message_send(req.params).await {
-            Ok(task) => (StatusCode::OK, jsonrpc_result(req.id, task)).into_response(),
-            Err(e) => (StatusCode::OK, jsonrpc_error(req.id, -32602, &e)).into_response(),
-        },
-        // DEPRECATED: pre-A2A-compliance shape, kept only so peers still
-        // running an older build of this agent don't break mid-rollout.
-        // Remove once every host in the mesh is confirmed updated.
+        // Single dispatch method: { "method": "tools/call", "params": { "name": "...", "arguments": {...} } }
         "tools/call" => {
             let call: ToolCall = match serde_json::from_value(req.params) {
                 Ok(c) => c,
