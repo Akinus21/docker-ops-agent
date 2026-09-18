@@ -28,7 +28,7 @@ const MANIFEST_PATH: &str = "/etc/docker-ops-agent/discovery.toml";
 
 pub async fn load_manifest() -> DiscoveryManifest {
     match tokio::fs::read_to_string(MANIFEST_PATH).await {
-        Ok(s) => match toml::from_str(&s) {
+        Ok(s) => match basic_toml::from_str(&s) {
             Ok(m) => m,
             Err(e) => {
                 tracing::warn!("failed to parse {MANIFEST_PATH}: {e} — treating as empty manifest");
