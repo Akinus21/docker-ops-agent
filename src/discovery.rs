@@ -59,7 +59,7 @@ async fn find_container_by_image(image_hint: &str) -> Option<String> {
         .ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
     text.lines().find_map(|line| {
-        let mut parts = line.splitn(2, '	');
+        let mut parts = line.splitn(2, '\t');
         let name = parts.next()?;
         let image = parts.next()?;
         image
