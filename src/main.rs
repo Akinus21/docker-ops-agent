@@ -12,7 +12,16 @@
 //   - The A2A surface is intentionally minimal: agent card discovery
 //     + a single JSON-RPC endpoint that dispatches to the allowlist.
 //   - Extend by adding a new arm to `execute_tool` + a `ToolDef` entry.
-
+//   - The image itself is universal across every host — nothing
+//     host-specific is hardcoded. Per-host tooling comes from a
+//     mounted Brewfile (see entrypoint.sh); per-host service discovery
+//     comes from a mounted discovery.toml (see discovery.rs). What's
+//     actually found on a given host is persisted to /data/memory.json
+//     and re-verified on demand via discover_environment.
+ 
+mod discovery;
+mod memory;
+ 
 use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
@@ -24,12 +33,13 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{env, sync::Arc};
+use std::{collections::HashMap, env, sync::Arc};
 use tokio::process::Command;
+use tokio::sync::Mutex;
 use uuid::Uuid;
-
+ 
 // ---------------------------------------------------------------------
-// Config / auth
+// Config / auth / shared state
 // ---------------------------------------------------------------------
 //
 // Two distinct tokens are accepted:
@@ -40,17 +50,25 @@ use uuid::Uuid;
 //     Optional — if unset, this agent can still be called by Hermes,
 //     it just can't participate in outbound mesh calls or accept them
 //     from peers.
-
+ 
 struct AppState {
     bearer_token: String,
     mesh_token: Option<String>,
+    memory: Mutex<memory::Memory>,
+    pending_proposals: Mutex<HashMap<String, ServiceProposal>>,
 }
-
+ 
+#[derive(Debug, Clone)]
+struct ServiceProposal {
+    role: String,
+    content: String,
+}
+ 
 fn expected_token() -> String {
     env::var("A2A_STATIC_AUTH_TOKEN")
         .expect("A2A_STATIC_AUTH_TOKEN must be set — see README for format")
 }
-
+ 
 fn check_auth(headers: &HeaderMap, state: &AppState) -> bool {
     let Some(value) = headers.get("authorization") else {
         return false;
@@ -71,7 +89,7 @@ fn check_auth(headers: &HeaderMap, state: &AppState) -> bool {
     }
     false
 }
-
+ 
 // ---------------------------------------------------------------------
 // Allowlisted tools
 // ---------------------------------------------------------------------
@@ -82,22 +100,18 @@ fn check_auth(headers: &HeaderMap, state: &AppState) -> bool {
 // shell string — so there is no injection path even if validation had
 // a gap.
 //
-// Tool AVAILABILITY is determined at runtime, not baked into the image:
-// each ToolDef names the binary it depends on, and the agent checks
-// `which <binary>` at startup. A tool whose binary isn't installed on
-// this particular host simply doesn't appear in the agent card or
-// tools/list, and calling it returns a clear "not available on this
-// host" error rather than a confusing spawn failure. This lets one
-// image run on every host with different tooling (installed via a
-// per-host Brewfile at container start — see entrypoint.sh) without
-// any per-host code or image changes.
-
+// Tool AVAILABILITY (binary-gated tools) is determined at runtime, not
+// baked into the image: each ToolDef names the binary it depends on,
+// and the agent checks `which <binary>` at startup. The service_config_*
+// tools are additionally role-gated at call time against whatever this
+// host's discovery actually found — see execute_tool.
+ 
 static SAFE_NAME: Lazy<Regex> = Lazy::new(|| Regex::new(r"^[a-zA-Z0-9_.-]+$").unwrap());
-
+ 
 fn valid_name(s: &str) -> bool {
     !s.is_empty() && s.len() <= 128 && SAFE_NAME.is_match(s)
 }
-
+ 
 struct ToolDef {
     id: &'static str,
     name: &'static str,
@@ -108,7 +122,7 @@ struct ToolDef {
     /// and tools/list, and calls to it are rejected up front.
     requires_binary: &'static str,
 }
-
+ 
 static TOOL_DEFS: &[ToolDef] = &[
     ToolDef {
         id: "anvil_docker_update",
@@ -141,51 +155,58 @@ static TOOL_DEFS: &[ToolDef] = &[
     ToolDef {
         id: "network_diagnose",
         name: "Network Diagnose",
-        description: "Diagnose DNS/connectivity for a hostname reachable from this host — runs getent hosts + docker network inspect against the target's container network. Arguments: target (string, required — a hostname or container name).",
+        description: "Diagnose DNS/connectivity for a hostname reachable from this host — runs getent hosts + docker network inspect against the bridge network. Arguments: target (string, required — a hostname or container name).",
         tags: &["network", "debug"],
         requires_binary: "docker",
     },
     ToolDef {
-        id: "caddy_config_read",
-        name: "Caddy Config Read",
-        description: "Read the live Caddyfile from the caddy container. No arguments.",
-        tags: &["caddy", "config", "debug"],
+        id: "discover_environment",
+        name: "Discover Environment",
+        description: "Re-run service discovery against this host's discovery.toml manifest (if mounted) and update memory with what's actually found running. Call this if a service was restarted/renamed and memory might be stale, or to check what roles this host actually has. No arguments.",
+        tags: &["discovery", "memory"],
         requires_binary: "docker",
     },
     ToolDef {
-        id: "caddy_config_propose",
-        name: "Caddy Config Propose",
-        description: "Stage a proposed full replacement of the Caddyfile without applying it. Returns a proposal_id and shows current vs proposed content side by side for review. Does NOT touch the live config. Arguments: proposed_content (string, required).",
-        tags: &["caddy", "config", "propose"],
+        id: "service_config_read",
+        name: "Service Config Read",
+        description: "Read the live config file for a discovered service role on this host. Arguments: role (string, required — must match a role this host's discovery manifest declares and actually found running; call discover_environment first if unsure what roles exist here).",
+        tags: &["config", "debug"],
         requires_binary: "docker",
     },
     ToolDef {
-        id: "caddy_config_apply",
-        name: "Caddy Config Apply",
-        description: "Apply a previously staged proposal (from caddy_config_propose) and reload Caddy. Only works with a valid, still-pending proposal_id — cannot apply arbitrary content directly. Arguments: proposal_id (string, required).",
-        tags: &["caddy", "config", "apply"],
+        id: "service_config_propose",
+        name: "Service Config Propose",
+        description: "Stage a proposed full replacement of a discovered service's config file without applying it. Returns a proposal_id and shows current vs proposed content side by side for review. Does NOT touch the live config. Arguments: role (string, required), proposed_content (string, required).",
+        tags: &["config", "propose"],
+        requires_binary: "docker",
+    },
+    ToolDef {
+        id: "service_config_apply",
+        name: "Service Config Apply",
+        description: "Apply a previously staged proposal and run that service role's reload command (if any). Only works with a valid, still-pending proposal_id — cannot apply arbitrary content directly. Requires explicit go-ahead from Gabriel in the requesting conversation before calling this, even with a valid proposal_id — see /data/instructions.md approval policy. Arguments: proposal_id (string, required).",
+        tags: &["config", "apply"],
+        requires_binary: "docker",
+    },
+    ToolDef {
+        id: "update_instructions",
+        name: "Update Instructions",
+        description: "Append a learned note to the human-editable instructions file at /data/instructions.md and to persisted memory. Use this to record something learned that should persist and guide future actions — a corrected path, a policy clarification Gabriel gave, etc. Arguments: note (string, required).",
+        tags: &["memory", "instructions"],
         requires_binary: "docker",
     },
     // Add new tools here as ToolDef entries. Pick whatever binary the
     // tool genuinely depends on for `requires_binary` — if that binary
     // isn't installed on a given host (no matching line in that host's
     // Brewfile), the tool just won't appear there. No code branching
-    // per host needed.
+    // per host needed. For anything host-specific (a particular
+    // service's config), prefer extending the generic service_config_*
+    // tools' role handling rather than adding a new per-service tool —
+    // that's what keeps the image universal.
 ];
-
+ 
 /// Binaries found on $PATH at startup, checked once via `which`.
 static AVAILABLE_BINARIES: Lazy<std::collections::HashSet<String>> = Lazy::new(detect_binaries);
-
-// In-memory store for staged-but-not-yet-applied Caddy config changes.
-// A proposal must exist here before caddy_config_apply will act on it —
-// this is what stops a single tool call from directly mutating a live
-// service config; the change has to be visible (via caddy_config_propose's
-// output) before anything gets applied. Proposals don't survive a
-// container restart, which is intentional — a stale half-approved change
-// shouldn't silently resurrect itself.
-static PENDING_CADDY_PROPOSALS: Lazy<std::sync::Mutex<std::collections::HashMap<String, String>>> =
-    Lazy::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-
+ 
 fn detect_binaries() -> std::collections::HashSet<String> {
     let mut found = std::collections::HashSet::new();
     let mut needed: std::collections::HashSet<&str> =
@@ -205,27 +226,27 @@ fn detect_binaries() -> std::collections::HashSet<String> {
     }
     found
 }
-
+ 
 fn available_tools() -> Vec<&'static ToolDef> {
     TOOL_DEFS
         .iter()
         .filter(|t| AVAILABLE_BINARIES.contains(t.requires_binary))
         .collect()
 }
-
+ 
 #[derive(Debug, Deserialize)]
 struct ToolCall {
     name: String,
     #[serde(default)]
     arguments: Value,
 }
-
+ 
 #[derive(Debug, Serialize)]
 struct ToolResult {
     ok: bool,
     output: String,
 }
-
+ 
 async fn run_command(program: &str, args: &[&str]) -> ToolResult {
     match Command::new(program).args(args).output().await {
         Ok(out) => {
@@ -242,21 +263,56 @@ async fn run_command(program: &str, args: &[&str]) -> ToolResult {
         },
     }
 }
-
+ 
 // Path to the compose file this agent is allowed to operate against.
 // Bake this in at build time or override via env if you run multiple
 // stacks; kept as a constant here to avoid the agent ever being told
-// an arbitrary compose file path at call time.
+// an arbitrary compose file path at call time. (This one constant is
+// intentionally still fixed rather than discovered — every host in
+// this mesh uses the same /stack/compose.yaml mount convention, unlike
+// service roles which genuinely differ per host.)
 const COMPOSE_FILE: &str = "/stack/compose.yaml";
-
-// Caddy container name + config path this agent is allowed to read/write.
-// Verify these match your actual Services host setup before trusting
-// caddy_config_apply with anything real (e.g. `docker exec caddy which caddy`,
-// `docker exec caddy cat <path>`).
-const CADDY_CONTAINER: &str = "caddy";
-const CADDY_CONFIG_PATH: &str = "/etc/caddy/Caddyfile";
-
-async fn execute_tool(call: ToolCall) -> ToolResult {
+ 
+const INSTRUCTIONS_PATH: &str = "/data/instructions.md";
+ 
+const DEFAULT_INSTRUCTIONS_TEMPLATE: &str = r#"# docker-ops-agent instructions
+ 
+Rules this agent (and Hermes, when calling it) should follow when
+executing gated actions. Hermes can append to this file via the
+update_instructions tool; you can also edit it directly on disk —
+this file is the single source of truth either way. Environment
+details (which services live on this host, their config paths) are
+tracked in /data/memory.json and discovery.toml, not here — this file
+is for policy and learned notes, not raw facts.
+ 
+## Approval policy
+ 
+- service_config_apply requires a proposal_id from service_config_propose
+  in the same session — the agent already refuses to apply without one.
+- Do not run service_config_apply without an explicit go-ahead from
+  Gabriel in the conversation that requested it, even if a proposal_id
+  is valid. State the proposal is ready and wait for confirmation.
+- compose_restart, docker_logs, docker_ps, network_diagnose, and
+  service_config_read may be called freely — no approval needed, these
+  are read-only or safely reversible.
+ 
+## Notes learned over time
+ 
+(Hermes appends dated entries here via update_instructions; manual
+edits are equally valid — no special marker needed to distinguish them.)
+"#;
+ 
+async fn ensure_instructions_file_exists() {
+    if tokio::fs::metadata(INSTRUCTIONS_PATH).await.is_err() {
+        if let Err(e) = tokio::fs::write(INSTRUCTIONS_PATH, DEFAULT_INSTRUCTIONS_TEMPLATE).await {
+            tracing::warn!("could not write default instructions template: {e}");
+        } else {
+            tracing::info!("wrote default instructions template to {INSTRUCTIONS_PATH}");
+        }
+    }
+}
+ 
+async fn execute_tool(state: &AppState, call: ToolCall) -> ToolResult {
     let Some(def) = TOOL_DEFS.iter().find(|t| t.id == call.name) else {
         return ToolResult {
             ok: false,
@@ -275,7 +331,7 @@ async fn execute_tool(call: ToolCall) -> ToolResult {
             ),
         };
     }
-
+ 
     match call.name.as_str() {
         // anvil_docker_update { "service": "mcp-proxy", "wait_seconds": 15 }
         "anvil_docker_update" => {
@@ -294,7 +350,7 @@ async fn execute_tool(call: ToolCall) -> ToolResult {
             let arg = format!("{service}:{wait}");
             run_command("anvil", &["docker", "update", "--in-order", &arg]).await
         }
-
+ 
         // compose_restart { "service": "mcp-proxy" }
         "compose_restart" => {
             let Some(service) = call.arguments.get("service").and_then(|v| v.as_str()) else {
@@ -309,7 +365,7 @@ async fn execute_tool(call: ToolCall) -> ToolResult {
             )
             .await
         }
-
+ 
         // docker_logs { "container": "hermes", "tail": 100 }
         "docker_logs" => {
             let Some(container) = call.arguments.get("container").and_then(|v| v.as_str()) else {
@@ -327,12 +383,12 @@ async fn execute_tool(call: ToolCall) -> ToolResult {
             let tail_arg = tail.to_string();
             run_command("docker", &["logs", "--tail", &tail_arg, container]).await
         }
-
+ 
         // docker_ps {}
         "docker_ps" => {
-            run_command("docker", &["ps", "--format", "{{.Names}}\t{{.Status}}"]).await
+            run_command("docker", &["ps", "--format", "{{.Names}}	{{.Status}}"]).await
         }
-
+ 
         // network_diagnose { "target": "opencode-a2a" }
         "network_diagnose" => {
             let Some(target) = call.arguments.get("target").and_then(|v| v.as_str()) else {
@@ -341,87 +397,190 @@ async fn execute_tool(call: ToolCall) -> ToolResult {
             if !valid_name(target) {
                 return ToolResult { ok: false, output: "invalid `target` name".into() };
             }
-
+ 
             let dns = run_command("getent", &["hosts", target]).await;
             let net = run_command(
                 "docker",
                 &["network", "inspect", "bridge", "--format", "{{json .Containers}}"],
             )
             .await;
-
+ 
             ToolResult {
                 ok: dns.ok || net.ok,
                 output: format!(
-                    "--- getent hosts {target} ---\n{}\n--- docker network inspect (bridge) ---\n{}",
+                    "--- getent hosts {target} ---
+{}
+--- docker network inspect (bridge) ---
+{}",
                     dns.output, net.output
                 ),
             }
         }
-
-        // caddy_config_read {}
-        "caddy_config_read" => {
-            run_command("docker", &["exec", CADDY_CONTAINER, "cat", CADDY_CONFIG_PATH]).await
+ 
+        // discover_environment {}
+        "discover_environment" => {
+            let fresh = discovery::run_discovery().await;
+            let count = fresh.len();
+            let summary: Vec<String> = fresh
+                .iter()
+                .map(|s| {
+                    format!(
+                        "{} -> container '{}', config_path {:?}",
+                        s.role, s.container_name, s.config_path
+                    )
+                })
+                .collect();
+ 
+            let mut mem = state.memory.lock().await;
+            memory::replace_discovered(&mut mem, fresh);
+            let save_result = memory::save(&mem).await;
+            drop(mem);
+ 
+            if let Err(e) = save_result {
+                return ToolResult {
+                    ok: false,
+                    output: format!("discovery ran ({count} services found) but failed to persist: {e}"),
+                };
+            }
+ 
+            ToolResult {
+                ok: true,
+                output: if count == 0 {
+                    "discovery ran — no services found (no discovery.toml mounted on this host, or none of its declared roles are currently running)".to_string()
+                } else {
+                    format!("discovery updated memory with {count} service(s):
+{}", summary.join("
+"))
+                },
+            }
         }
-
-        // caddy_config_propose { "proposed_content": "..." }
-        "caddy_config_propose" => {
+ 
+        // service_config_read { "role": "reverse_proxy" }
+        "service_config_read" => {
+            let Some(role) = call.arguments.get("role").and_then(|v| v.as_str()) else {
+                return ToolResult { ok: false, output: "missing `role` argument".into() };
+            };
+            let mem = state.memory.lock().await;
+            let Some(svc) = memory::find_service(&mem, role) else {
+                return ToolResult {
+                    ok: false,
+                    output: format!(
+                        "no discovered service for role `{role}` on this host — call discover_environment first, or check this host's discovery.toml"
+                    ),
+                };
+            };
+            let Some(config_path) = &svc.config_path else {
+                return ToolResult {
+                    ok: false,
+                    output: format!("role `{role}` was discovered but no config path was found among its candidates"),
+                };
+            };
+            let container = svc.container_name.clone();
+            let config_path = config_path.clone();
+            drop(mem);
+ 
+            run_command("docker", &["exec", &container, "cat", &config_path]).await
+        }
+ 
+        // service_config_propose { "role": "reverse_proxy", "proposed_content": "..." }
+        "service_config_propose" => {
+            let Some(role) = call.arguments.get("role").and_then(|v| v.as_str()) else {
+                return ToolResult { ok: false, output: "missing `role` argument".into() };
+            };
             let Some(proposed) = call.arguments.get("proposed_content").and_then(|v| v.as_str()) else {
                 return ToolResult { ok: false, output: "missing `proposed_content` argument".into() };
             };
-
-            let current = run_command("docker", &["exec", CADDY_CONTAINER, "cat", CADDY_CONFIG_PATH]).await;
+ 
+            let mem = state.memory.lock().await;
+            let Some(svc) = memory::find_service(&mem, role) else {
+                return ToolResult {
+                    ok: false,
+                    output: format!("no discovered service for role `{role}` on this host — call discover_environment first"),
+                };
+            };
+            let Some(config_path) = svc.config_path.clone() else {
+                return ToolResult {
+                    ok: false,
+                    output: format!("role `{role}` has no known config path"),
+                };
+            };
+            let container = svc.container_name.clone();
+            drop(mem);
+ 
+            let current = run_command("docker", &["exec", &container, "cat", &config_path]).await;
             if !current.ok {
                 return ToolResult {
                     ok: false,
                     output: format!("could not read current config to compare against: {}", current.output),
                 };
             }
-
+ 
             let proposal_id = Uuid::new_v4().to_string();
-            PENDING_CADDY_PROPOSALS
-                .lock()
-                .unwrap()
-                .insert(proposal_id.clone(), proposed.to_string());
-
+            state.pending_proposals.lock().await.insert(
+                proposal_id.clone(),
+                ServiceProposal { role: role.to_string(), content: proposed.to_string() },
+            );
+ 
             ToolResult {
                 ok: true,
                 output: format!(
-                    "proposal_id: {proposal_id}\n\n--- CURRENT ---\n{}\n\n--- PROPOSED ---\n{}\n\nReview both, then call caddy_config_apply with this proposal_id to apply and reload.",
+                    "proposal_id: {proposal_id}
+role: {role}
+
+--- CURRENT ---
+{}
+
+--- PROPOSED ---
+{}
+
+Review both, get Gabriel's explicit go-ahead per /data/instructions.md approval policy, then call service_config_apply with this proposal_id.",
                     current.output, proposed
                 ),
             }
         }
-
-        // caddy_config_apply { "proposal_id": "..." }
-        "caddy_config_apply" => {
+ 
+        // service_config_apply { "proposal_id": "..." }
+        "service_config_apply" => {
             let Some(proposal_id) = call.arguments.get("proposal_id").and_then(|v| v.as_str()) else {
                 return ToolResult { ok: false, output: "missing `proposal_id` argument".into() };
             };
-
-            let content = {
-                let mut store = PENDING_CADDY_PROPOSALS.lock().unwrap();
-                store.remove(proposal_id)
-            };
-            let Some(content) = content else {
+ 
+            let proposal = state.pending_proposals.lock().await.remove(proposal_id);
+            let Some(proposal) = proposal else {
                 return ToolResult {
                     ok: false,
-                    output: "no pending proposal with that id — call caddy_config_propose first".into(),
+                    output: "no pending proposal with that id — call service_config_propose first".into(),
                 };
             };
-
-            // Write via a temp file inside the container, then move into
-            // place, so a failed write can't leave a half-written config.
+ 
+            let mem = state.memory.lock().await;
+            let Some(svc) = memory::find_service(&mem, &proposal.role) else {
+                return ToolResult {
+                    ok: false,
+                    output: format!(
+                        "role `{}` from this proposal is no longer known to this host (was memory cleared or the service removed?) — re-run discover_environment and start over",
+                        proposal.role
+                    ),
+                };
+            };
+            let Some(config_path) = svc.config_path.clone() else {
+                return ToolResult { ok: false, output: "service has no known config path".into() };
+            };
+            let container = svc.container_name.clone();
+            let reload_command = svc.reload_command.clone();
+            drop(mem);
+ 
+            let staged_path = format!("{config_path}.new");
             let write = Command::new("docker")
-                .args(["exec", "-i", CADDY_CONTAINER, "sh", "-c",
-                       &format!("cat > {CADDY_CONFIG_PATH}.new")])
+                .args(["exec", "-i", &container, "sh", "-c", &format!("cat > {staged_path}")])
                 .stdin(std::process::Stdio::piped())
                 .spawn();
-
+ 
             let write_result = match write {
                 Ok(mut child) => {
                     use tokio::io::AsyncWriteExt;
                     if let Some(mut stdin) = child.stdin.take() {
-                        let _ = stdin.write_all(content.as_bytes()).await;
+                        let _ = stdin.write_all(proposal.content.as_bytes()).await;
                     }
                     child.wait_with_output().await
                 }
@@ -429,7 +588,7 @@ async fn execute_tool(call: ToolCall) -> ToolResult {
                     return ToolResult { ok: false, output: format!("failed to write staged config: {e}") };
                 }
             };
-
+ 
             match write_result {
                 Ok(out) if out.status.success() => {}
                 Ok(out) => {
@@ -442,43 +601,84 @@ async fn execute_tool(call: ToolCall) -> ToolResult {
                     return ToolResult { ok: false, output: format!("staged write failed: {e}") };
                 }
             }
-
-            let mv = run_command(
-                "docker",
-                &["exec", CADDY_CONTAINER, "mv", &format!("{CADDY_CONFIG_PATH}.new"), CADDY_CONFIG_PATH],
-            )
-            .await;
+ 
+            let mv = run_command("docker", &["exec", &container, "mv", &staged_path, &config_path]).await;
             if !mv.ok {
                 return ToolResult { ok: false, output: format!("failed to move staged config into place: {}", mv.output) };
             }
-
-            // Caddy's own `caddy reload` validates the config before
-            // swapping it in — if the proposed content is malformed,
-            // this fails and the old config keeps serving, rather than
-            // Caddy going down on a bad config.
-            let reload = run_command(
-                "docker",
-                &["exec", CADDY_CONTAINER, "caddy", "reload", "--config", CADDY_CONFIG_PATH],
-            )
-            .await;
-
+ 
+            if reload_command.is_empty() {
+                return ToolResult {
+                    ok: true,
+                    output: "config written and moved into place. No reload_command configured for this role — the service may need a manual restart (see compose_restart).".to_string(),
+                };
+            }
+ 
+            // Substitute {config_path} in any reload_command arg with the
+            // real path, then run it inside the target container.
+            let substituted: Vec<String> = reload_command
+                .iter()
+                .map(|arg| arg.replace("{config_path}", &config_path))
+                .collect();
+            let mut exec_args: Vec<&str> = vec!["exec", &container];
+            exec_args.extend(substituted.iter().map(|s| s.as_str()));
+ 
+            let reload = run_command("docker", &exec_args).await;
             ToolResult {
                 ok: reload.ok,
-                output: format!("config written and moved into place.\nreload output: {}", reload.output),
+                output: format!("config written and moved into place.
+reload output: {}", reload.output),
             }
         }
-
+ 
+        // update_instructions { "note": "..." }
+        "update_instructions" => {
+            let Some(note) = call.arguments.get("note").and_then(|v| v.as_str()) else {
+                return ToolResult { ok: false, output: "missing `note` argument".into() };
+            };
+ 
+            let timestamp = chrono::Utc::now().to_rfc3339();
+            let entry = format!("
+- [{timestamp}] {note}");
+            let file_result = tokio::fs::OpenOptions::new()
+                .append(true)
+                .open(INSTRUCTIONS_PATH)
+                .await;
+ 
+            let file_ok = match file_result {
+                Ok(mut file) => {
+                    use tokio::io::AsyncWriteExt;
+                    file.write_all(entry.as_bytes()).await.is_ok()
+                }
+                Err(_) => false,
+            };
+ 
+            let mut mem = state.memory.lock().await;
+            memory::add_note(&mut mem, note.to_string(), "hermes");
+            let save_result = memory::save(&mem).await;
+            drop(mem);
+ 
+            ToolResult {
+                ok: file_ok && save_result.is_ok(),
+                output: format!(
+                    "instructions.md append: {}, memory.json save: {}",
+                    if file_ok { "ok" } else { "failed" },
+                    if save_result.is_ok() { "ok" } else { "failed" }
+                ),
+            }
+        }
+ 
         // Every id in TOOL_DEFS must have a matching arm above; this is
         // unreachable because execute_tool already looked the name up
         // in TOOL_DEFS before we get here.
         _ => unreachable!("tool id {} present in TOOL_DEFS without an execution arm", call.name),
     }
 }
-
+ 
 // ---------------------------------------------------------------------
 // A2A surface: agent card + JSON-RPC endpoint
 // ---------------------------------------------------------------------
-
+ 
 async fn agent_card() -> Json<Value> {
     let host = env::var("A2A_HOST_LABEL").unwrap_or_else(|_| "unknown-host".to_string());
     let self_card_url = env::var("A2A_SELF_CARD_URL")
@@ -495,11 +695,11 @@ async fn agent_card() -> Json<Value> {
             })
         })
         .collect();
-
+ 
     Json(json!({
         "name": format!("docker-ops-agent ({host})"),
-        "description": "Host Docker/Anvil operations exposed as a narrow, allowlisted A2A tool surface, scoped to whatever tooling is actually installed on this host. Does not grant raw shell or docker-socket access to callers — every operation is a named, validated function.",
-        "version": "0.3.0",
+        "description": "Host Docker/Anvil operations exposed as a narrow, allowlisted A2A tool surface, scoped to whatever tooling is actually installed on this host and whatever services this host's discovery.toml manifest declares. Does not grant raw shell or docker-socket access to callers — every operation is a named, validated function. Config-mutating tools (service_config_apply) require staging a reviewable proposal first.",
+        "version": "0.4.0",
         "hostLabel": host,
         "supportedInterfaces": [
             { "url": self_rpc_base, "protocolBinding": "JSONRPC", "protocolVersion": "1.0" }
@@ -520,7 +720,7 @@ async fn agent_card() -> Json<Value> {
         "skills": skills
     }))
 }
-
+ 
 // ---------------------------------------------------------------------
 // Outbound mesh calling — this is what makes the mesh a real mesh
 // rather than hub-and-spoke: any docker-ops-agent can query the
@@ -528,14 +728,14 @@ async fn agent_card() -> Json<Value> {
 // through Hermes. Uses curl (already shelled out to elsewhere in this
 // file) rather than adding an HTTP client dependency.
 // ---------------------------------------------------------------------
-
+ 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 struct RegistryPeer {
     host_label: String,
     role: String,
     agent_card_url: String,
 }
-
+ 
 async fn fetch_registry_peers() -> Result<Vec<RegistryPeer>, String> {
     let registry_url = env::var("REGISTRY_URL")
         .map_err(|_| "REGISTRY_URL is not configured on this agent".to_string())?;
@@ -558,7 +758,7 @@ async fn fetch_registry_peers() -> Result<Vec<RegistryPeer>, String> {
     .map_err(|e| format!("could not parse peer list: {e}"))?;
     Ok(peers)
 }
-
+ 
 /// Derive the base JSON-RPC URL (the POST / endpoint) from a peer's
 /// published agent-card URL, which always ends in
 /// /.well-known/agent-card.json per the A2A spec.
@@ -567,7 +767,7 @@ fn peer_rpc_base(agent_card_url: &str) -> String {
         .trim_end_matches("/.well-known/agent-card.json")
         .to_string()
 }
-
+ 
 /// Call another agent's tools/call endpoint using the shared mesh
 /// token. Returns the raw JSON result the peer sent back.
 async fn call_peer(
@@ -583,7 +783,7 @@ async fn call_peer(
         "params": { "name": tool_name, "arguments": arguments }
     })
     .to_string();
-
+ 
     let out = Command::new("curl")
         .args([
             "-s",
@@ -600,7 +800,7 @@ async fn call_peer(
         .output()
         .await
         .map_err(|e| format!("failed to reach peer: {e}"))?;
-
+ 
     if !out.status.success() {
         return Err(format!(
             "peer request exited non-zero: {}",
@@ -609,7 +809,7 @@ async fn call_peer(
     }
     serde_json::from_slice(&out.stdout).map_err(|e| format!("peer returned invalid JSON: {e}"))
 }
-
+ 
 #[derive(Debug, Deserialize)]
 struct MeshCallParams {
     /// Match a peer by host_label (preferred — unambiguous) or, if
@@ -620,18 +820,18 @@ struct MeshCallParams {
     #[serde(default)]
     arguments: Value,
 }
-
+ 
 async fn handle_mesh_call(state: &AppState, params: Value) -> Result<Value, String> {
     let mesh_token = state.mesh_token.clone().ok_or_else(|| {
         "MESH_AUTH_TOKEN is not configured on this agent — cannot make outbound mesh calls"
             .to_string()
     })?;
-
+ 
     let call: MeshCallParams =
         serde_json::from_value(params).map_err(|e| format!("invalid mesh_call params: {e}"))?;
-
+ 
     let peers = fetch_registry_peers().await?;
-
+ 
     let matches: Vec<&RegistryPeer> = peers
         .iter()
         .filter(|p| {
@@ -642,7 +842,7 @@ async fn handle_mesh_call(state: &AppState, params: Value) -> Result<Value, Stri
                 && call.role.as_ref().map(|r| &p.role == r).unwrap_or(true)
         })
         .collect();
-
+ 
     let target = match matches.len() {
         0 => return Err("no registered peer matches the given host_label/role".to_string()),
         1 => matches[0],
@@ -653,11 +853,11 @@ async fn handle_mesh_call(state: &AppState, params: Value) -> Result<Value, Stri
             ))
         }
     };
-
+ 
     let rpc_base = peer_rpc_base(&target.agent_card_url);
     call_peer(&rpc_base, &mesh_token, &call.tool_name, call.arguments).await
 }
-
+ 
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
     #[allow(dead_code)]
@@ -667,7 +867,7 @@ struct JsonRpcRequest {
     #[serde(default)]
     params: Value,
 }
-
+ 
 fn jsonrpc_error(id: Option<Value>, code: i64, message: &str) -> Json<Value> {
     Json(json!({
         "jsonrpc": "2.0",
@@ -675,7 +875,7 @@ fn jsonrpc_error(id: Option<Value>, code: i64, message: &str) -> Json<Value> {
         "error": { "code": code, "message": message }
     }))
 }
-
+ 
 fn jsonrpc_result(id: Option<Value>, result: Value) -> Json<Value> {
     Json(json!({
         "jsonrpc": "2.0",
@@ -683,7 +883,7 @@ fn jsonrpc_result(id: Option<Value>, result: Value) -> Json<Value> {
         "result": result
     }))
 }
-
+ 
 async fn rpc_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -696,7 +896,7 @@ async fn rpc_handler(
         )
             .into_response();
     }
-
+ 
     let req: JsonRpcRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => {
@@ -707,7 +907,7 @@ async fn rpc_handler(
                 .into_response();
         }
     };
-
+ 
     match req.method.as_str() {
         // Single dispatch method: { "method": "tools/call", "params": { "name": "...", "arguments": {...} } }
         "tools/call" => {
@@ -721,7 +921,7 @@ async fn rpc_handler(
                         .into_response();
                 }
             };
-            let result = execute_tool(call).await;
+            let result = execute_tool(&state, call).await;
             (
                 StatusCode::OK,
                 jsonrpc_result(req.id, json!({ "ok": result.ok, "output": result.output })),
@@ -759,11 +959,11 @@ async fn rpc_handler(
             .into_response(),
     }
 }
-
+ 
 async fn agent_card_route() -> impl IntoResponse {
     (StatusCode::OK, agent_card().await)
 }
-
+ 
 // ---------------------------------------------------------------------
 // Mesh registry self-registration (stand-in for DNS-SD advertising —
 // see README for why). If REGISTRY_URL is set, this agent periodically
@@ -772,7 +972,7 @@ async fn agent_card_route() -> impl IntoResponse {
 // Silently does nothing if REGISTRY_URL isn't set — registration is
 // optional, the agent works standalone without it.
 // ---------------------------------------------------------------------
-
+ 
 async fn registry_heartbeat_loop() {
     let Ok(registry_url) = env::var("REGISTRY_URL") else {
         tracing::info!("REGISTRY_URL not set — mesh registry self-registration disabled");
@@ -788,7 +988,7 @@ async fn registry_heartbeat_loop() {
     });
     let ttl_seconds: u64 = 90;
     let heartbeat_every = std::time::Duration::from_secs(30);
-
+ 
     let payload = json!({
         "host_label": host_label,
         "role": "docker-ops",
@@ -796,7 +996,7 @@ async fn registry_heartbeat_loop() {
         "ttl_seconds": ttl_seconds
     })
     .to_string();
-
+ 
     loop {
         let result = Command::new("curl")
             .args([
@@ -817,7 +1017,7 @@ async fn registry_heartbeat_loop() {
             ])
             .output()
             .await;
-
+ 
         match result {
             Ok(out) => {
                 let code = String::from_utf8_lossy(&out.stdout).to_string();
@@ -829,27 +1029,43 @@ async fn registry_heartbeat_loop() {
             }
             Err(e) => tracing::warn!("registry heartbeat failed to run curl: {e}"),
         }
-
+ 
         tokio::time::sleep(heartbeat_every).await;
     }
 }
-
+ 
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
-
+ 
+    ensure_instructions_file_exists().await;
+ 
+    // Startup discovery: find whatever this host's discovery.toml (if
+    // any) declares and is actually running, and persist it. A host
+    // with no manifest mounted just ends up with an empty
+    // discovered_services list — not an error.
+    let mut mem = memory::load().await;
+    let fresh = discovery::run_discovery().await;
+    tracing::info!("startup discovery found {} service(s)", fresh.len());
+    memory::replace_discovered(&mut mem, fresh);
+    if let Err(e) = memory::save(&mem).await {
+        tracing::warn!("failed to persist startup discovery results: {e}");
+    }
+ 
     let state = Arc::new(AppState {
         bearer_token: expected_token(),
         mesh_token: env::var("MESH_AUTH_TOKEN").ok(),
+        memory: Mutex::new(mem),
+        pending_proposals: Mutex::new(HashMap::new()),
     });
-
+ 
     let app = Router::new()
         .route("/.well-known/agent-card.json", get(agent_card_route))
         .route("/", post(rpc_handler))
         .with_state(state);
-
+ 
     tokio::spawn(registry_heartbeat_loop());
-
+ 
     let port = env::var("BIND_PORT").unwrap_or_else(|_| "8000".to_string());
     let addr = format!("0.0.0.0:{port}");
     tracing::info!("docker-ops-agent listening on {addr}");
