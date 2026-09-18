@@ -11,7 +11,7 @@ FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates docker.io \
-        build-essential procps curl file git sudo \
+        build-essential procps curl file git sudo jq gawk \
     && rm -rf /var/lib/apt/lists/*
 
 # docker-compose-plugin isn't in Debian's default apt repos (only via

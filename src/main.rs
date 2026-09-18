@@ -194,6 +194,34 @@ static TOOL_DEFS: &[ToolDef] = &[
         tags: &["memory", "instructions"],
         requires_binary: "docker",
     },
+    ToolDef {
+        id: "container_restart",
+        name: "Container Restart",
+        description: "Restart a named container (not a compose service — works for standalone containers). Use this when compose_restart is not applicable. Arguments: container (string, required).",
+        tags: &["docker", "operate"],
+        requires_binary: "docker",
+    },
+    ToolDef {
+        id: "env_get",
+        name: "Env Get",
+        description: "Read environment variables from a running container as key=value lines. Arguments: container (string, required), filter (string, optional — only return vars whose name contains this substring, case-insensitive).",
+        tags: &["docker", "debug", "env"],
+        requires_binary: "docker",
+    },
+    ToolDef {
+        id: "env_update",
+        name: "Env Update",
+        description: "Update KEY=value entries in a .env file on the host filesystem (at /stack/.env by default, or in the directory specified by COMPOSE_DIR). Only modifies existing keys or adds new ones — never rewrites unrelated content. Returns a diff of what changed. Arguments: values (map of string->string, required — keys and their new values).",
+        tags: &["docker", "compose", "env"],
+        requires_binary: "gawk",
+    },
+    ToolDef {
+        id: "compose_logs",
+        name: "Compose Logs",
+        description: "Fetch logs for a compose service from `docker compose logs`. Arguments: service (string, required), tail (integer, default 100, max 2000).",
+        tags: &["docker", "compose", "debug"],
+        requires_binary: "docker",
+    },
     // Add new tools here as ToolDef entries. Pick whatever binary the
     // tool genuinely depends on for `requires_binary` — if that binary
     // isn't installed on a given host (no matching line in that host's
@@ -264,14 +292,10 @@ async fn run_command(program: &str, args: &[&str]) -> ToolResult {
     }
 }
  
-// Path to the compose file this agent is allowed to operate against.
-// Bake this in at build time or override via env if you run multiple
-// stacks; kept as a constant here to avoid the agent ever being told
-// an arbitrary compose file path at call time. (This one constant is
-// intentionally still fixed rather than discovered — every host in
-// this mesh uses the same /stack/compose.yaml mount convention, unlike
-// service roles which genuinely differ per host.)
-const COMPOSE_FILE: &str = "/stack/compose.yaml";
+// Path to the compose directory this agent is allowed to operate against.
+// Override via COMPOSE_DIR env var; falls back to /stack for backwards
+// compatibility. The directory must contain a compose.yaml or compose.yml.
+const COMPOSE_DIR: &str = "/stack";
  
 const INSTRUCTIONS_PATH: &str = "/data/instructions.md";
  
@@ -359,9 +383,10 @@ async fn execute_tool(state: &AppState, call: ToolCall) -> ToolResult {
             if !valid_name(service) {
                 return ToolResult { ok: false, output: "invalid `service` name".into() };
             }
+            let compose_dir = env::var("COMPOSE_DIR").unwrap_or_else(|_| COMPOSE_DIR.to_string());
             run_command(
                 "docker",
-                &["compose", "-f", COMPOSE_FILE, "restart", service],
+                &["compose", "-f", &format!("{}/compose.yaml", compose_dir), "restart", service],
             )
             .await
         }
@@ -668,6 +693,143 @@ reload output: {}", reload.output),
             }
         }
  
+        // container_restart { "container": "vikunja" }
+        "container_restart" => {
+            let Some(container) = call.arguments.get("container").and_then(|v| v.as_str()) else {
+                return ToolResult { ok: false, output: "missing `container` argument".into() };
+            };
+            if !valid_name(container) {
+                return ToolResult { ok: false, output: "invalid `container` name".into() };
+            }
+            run_command("docker", &["restart", container]).await
+        }
+
+        // env_get { "container": "vikunja", "filter": "VIKUNJA" }
+        "env_get" => {
+            let Some(container) = call.arguments.get("container").and_then(|v| v.as_str()) else {
+                return ToolResult { ok: false, output: "missing `container` argument".into() };
+            };
+            if !valid_name(container) {
+                return ToolResult { ok: false, output: "invalid `container` name".into() };
+            }
+            let filter = call
+                .arguments
+                .get("filter")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let out = run_command("docker", &["exec", container, "env"]).await;
+            let vars = &out.output;
+            let filtered: Vec<&str> = if filter.is_empty() {
+                vars.lines().collect()
+            } else {
+                vars.lines()
+                    .filter(|l| l.contains(filter))
+                    .collect()
+            };
+            ToolResult {
+                ok: out.ok,
+                output: filtered.join("\n"),
+            }
+        }
+
+        // env_update { "values": { "VIKUNJA_SERVICE_PUBLICURL": "https://todo.akinus21.com" } }
+        "env_update" => {
+            let Some(values) = call.arguments.get("values").and_then(|v| v.as_object()) else {
+                return ToolResult { ok: false, output: "missing `values` argument (must be a map)".into() };
+            };
+            if values.is_empty() {
+                return ToolResult { ok: false, output: "`values` map is empty — nothing to update".into() };
+            }
+            let compose_dir = env::var("COMPOSE_DIR").unwrap_or_else(|_| COMPOSE_DIR.to_string());
+            let env_path = format!("{}/.env", compose_dir);
+
+            // Read current env file
+            let current = match tokio::fs::read_to_string(&env_path).await {
+                Ok(c) => c,
+                Err(e) => {
+                    return ToolResult {
+                        ok: false,
+                        output: format!("could not read {}: {e}", env_path),
+                    };
+                }
+            };
+
+            let mut changes = vec![];
+            let mut new_lines = Vec::new();
+            let mut updated_keys = std::collections::HashSet::new();
+
+            for line in current.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() || trimmed.starts_with('#') {
+                    new_lines.push(line.to_string());
+                    continue;
+                }
+                if let Some((key, _)) = line.split_once('=') {
+                    if let Some(new_val) = values.get(key) {
+                        new_lines.push(format!("{}={}", key, new_val));
+                        changes.push(format!("  {}: (was {:?}) -> {:?}", key, line.split_once('=').map(|(_, v)| v), new_val));
+                        updated_keys.insert(key.to_string());
+                        continue;
+                    }
+                }
+                new_lines.push(line.to_string());
+            }
+            // Add keys that weren't in the file
+            for (key, new_val) in values {
+                if !updated_keys.contains(key) {
+                    new_lines.push(format!("{}={}", key, new_val));
+                    changes.push(format!("  {}: (new) -> {:?}", key, new_val));
+                }
+            }
+
+            let new_content = new_lines.join("\n");
+            if let Err(e) = tokio::fs::write(&env_path, new_content).await {
+                return ToolResult {
+                    ok: false,
+                    output: format!("failed to write {}: {e}", env_path),
+                };
+            }
+
+            ToolResult {
+                ok: true,
+                output: if changes.is_empty() {
+                    "no changes needed — all keys already have the requested values".into()
+                } else {
+                    format!("updated {}:\n{}", env_path, changes.join("\n"))
+                },
+            }
+        }
+
+        // compose_logs { "service": "vikunja", "tail": 100 }
+        "compose_logs" => {
+            let Some(service) = call.arguments.get("service").and_then(|v| v.as_str()) else {
+                return ToolResult { ok: false, output: "missing `service` argument".into() };
+            };
+            if !valid_name(service) {
+                return ToolResult { ok: false, output: "invalid `service` name".into() };
+            }
+            let tail = call
+                .arguments
+                .get("tail")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(100)
+                .min(2000);
+            let compose_dir = env::var("COMPOSE_DIR").unwrap_or_else(|_| COMPOSE_DIR.to_string());
+            run_command(
+                "docker",
+                &[
+                    "compose",
+                    "-f",
+                    &format!("{}/compose.yaml", compose_dir),
+                    "logs",
+                    "--tail",
+                    &tail.to_string(),
+                    service,
+                ],
+            )
+            .await
+        }
+
         // Every id in TOOL_DEFS must have a matching arm above; this is
         // unreachable because execute_tool already looked the name up
         // in TOOL_DEFS before we get here.
@@ -699,7 +861,7 @@ async fn agent_card() -> Json<Value> {
     Json(json!({
         "name": format!("docker-ops-agent ({host})"),
         "description": "Host Docker/Anvil operations exposed as a narrow, allowlisted A2A tool surface, scoped to whatever tooling is actually installed on this host and whatever services this host's discovery.toml manifest declares. Does not grant raw shell or docker-socket access to callers — every operation is a named, validated function. Config-mutating tools (service_config_apply) require staging a reviewable proposal first.",
-        "version": "0.4.0",
+        "version": "0.5.0",
         "hostLabel": host,
         "supportedInterfaces": [
             { "url": self_rpc_base, "protocolBinding": "JSONRPC", "protocolVersion": "1.0" }
