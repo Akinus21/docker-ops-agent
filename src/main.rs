@@ -731,10 +731,11 @@ reload output: {}", reload.output),
                 return ToolResult { ok: false, output: "invalid `container` name".into() };
             }
 
-            // 1. Inspect the container's config
+            // 1. Inspect the container's full config (including HostConfig which moved
+            // out of Config in newer Docker API versions)
             let inspect = run_command(
                 "docker",
-                &["inspect", "--format", "{{json .Config}}", container],
+                &["inspect", "--format", "{{json .}}", container],
             )
             .await;
             if !inspect.ok {
