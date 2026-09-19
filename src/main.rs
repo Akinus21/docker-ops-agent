@@ -745,6 +745,12 @@ reload output: {}", reload.output),
             }
 
             #[derive(serde::Deserialize)]
+            struct ContainerInspect {
+                #[serde(rename = "Config")]
+                config: ContainerConfig,
+            }
+
+            #[derive(serde::Deserialize)]
             struct ContainerConfig {
                 #[serde(rename = "Env")]
                 env: Vec<String>,
@@ -757,12 +763,21 @@ reload output: {}", reload.output),
                 host_config: serde_json::Value,
             }
 
-            let cfg: ContainerConfig = match serde_json::from_str(&inspect.output) {
+            let inspect_list: Vec<ContainerInspect> = match serde_json::from_str(&inspect.output) {
                 Ok(c) => c,
                 Err(e) => {
                     return ToolResult {
                         ok: false,
-                        output: format!("failed to parse docker inspect JSON: {e} — output was: {}", inspect.output),
+                        output: format!("failed to parse docker inspect JSON (not an array?): {e} — output was: {}", inspect.output),
+                    };
+                }
+            };
+            let cfg = match inspect_list.into_iter().next() {
+                Some(c) => c.config,
+                None => {
+                    return ToolResult {
+                        ok: false,
+                        output: "docker inspect returned empty array — container may be gone".into(),
                     };
                 }
             };
