@@ -229,6 +229,13 @@ static TOOL_DEFS: &[ToolDef] = &[
         tags: &["docker", "compose", "debug"],
         requires_binary: "docker",
     },
+    ToolDef {
+        id: "compose_up_force_recreate",
+        name: "Compose Up Force Recreate",
+        description: "Run `docker compose up -d --force-recreate <service>` to stop, remove, and recreate a compose service with fresh env vars from the current .env file. Use this after editing .env to force Docker to re-read updated environment variables. Arguments: service (string, required).",
+        tags: &["docker", "compose", "operate"],
+        requires_binary: "docker",
+    },
     // Add new tools here as ToolDef entries. Pick whatever binary the
     // tool genuinely depends on for `requires_binary` — if that binary
     // isn't installed on a given host (no matching line in that host's
@@ -1023,6 +1030,30 @@ reload output: {}", reload.output),
                     "logs",
                     "--tail",
                     &tail.to_string(),
+                    service,
+                ],
+            )
+            .await
+        }
+
+        // compose_up_force_recreate { "service": "vikunja" }
+        "compose_up_force_recreate" => {
+            let Some(service) = call.arguments.get("service").and_then(|v| v.as_str()) else {
+                return ToolResult { ok: false, output: "missing `service` argument".into() };
+            };
+            if !valid_name(service) {
+                return ToolResult { ok: false, output: "invalid `service` name".into() };
+            }
+            let compose_dir = env::var("COMPOSE_DIR").unwrap_or_else(|_| COMPOSE_DIR.to_string());
+            run_command(
+                "docker",
+                &[
+                    "compose",
+                    "-f",
+                    &format!("{}/compose.yaml", compose_dir),
+                    "up",
+                    "-d",
+                    "--force-recreate",
                     service,
                 ],
             )
