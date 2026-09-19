@@ -197,7 +197,14 @@ static TOOL_DEFS: &[ToolDef] = &[
     ToolDef {
         id: "container_restart",
         name: "Container Restart",
-        description: "Restart a named container (not a compose service — works for standalone containers). Use this when compose_restart is not applicable. Arguments: container (string, required).",
+        description: "Restart a stopped or running container (docker restart). Note: this preserves the original env vars from when the container was first created — it does NOT re-read .env files. For containers whose env may have changed, use container_recreate instead.",
+        tags: &["docker", "operate"],
+        requires_binary: "docker",
+    },
+    ToolDef {
+        id: "container_recreate",
+        name: "Container Recreate",
+        description: "Recreate a container using the same image, ports, volumes, and environment as the original. The container is removed and recreated fresh, which forces Docker to re-read the current .env file for any env vars. Use this after editing .env to pick up changes that docker restart would miss. Arguments: container (string, required).",
         tags: &["docker", "operate"],
         requires_binary: "docker",
     },
@@ -702,6 +709,198 @@ reload output: {}", reload.output),
                 return ToolResult { ok: false, output: "invalid `container` name".into() };
             }
             run_command("docker", &["restart", container]).await
+        }
+
+        // container_recreate { "container": "vikunja" }
+        // Stops the container, removes it, then re-creates it fresh using
+        // the same image/ports/volumes but with the current .env file's
+        // env vars as the base. Extra vars from the original container's
+        // docker-created env (not from .env) are preserved.
+        "container_recreate" => {
+            let Some(container) = call.arguments.get("container").and_then(|v| v.as_str()) else {
+                return ToolResult { ok: false, output: "missing `container` argument".into() };
+            };
+            if !valid_name(container) {
+                return ToolResult { ok: false, output: "invalid `container` name".into() };
+            }
+
+            // 1. Inspect the container's config
+            let inspect = run_command(
+                "docker",
+                &["inspect", "--format", "{{json .Config}}", container],
+            )
+            .await;
+            if !inspect.ok {
+                return ToolResult {
+                    ok: false,
+                    output: format!("failed to inspect container: {}", inspect.output),
+                };
+            }
+
+            #[derive(serde::Deserialize)]
+            struct ContainerConfig {
+                #[serde(rename = "Env")]
+                env: Vec<String>,
+                #[serde(rename = "Image")]
+                image: String,
+                #[serde(rename = "ExposedPorts", default)]
+                #[allow(dead_code)]
+                exposed_ports: Option<serde_json::Value>,
+                #[serde(rename = "HostConfig")]
+                host_config: serde_json::Value,
+            }
+
+            let cfg: ContainerConfig = match serde_json::from_str(&inspect.output) {
+                Ok(c) => c,
+                Err(e) => {
+                    return ToolResult {
+                        ok: false,
+                        output: format!("failed to parse docker inspect JSON: {e} — output was: {}", inspect.output),
+                    };
+                }
+            };
+
+            // 2. Stop the container
+            let stop = run_command("docker", &["stop", container]).await;
+            if !stop.ok {
+                return ToolResult {
+                    ok: false,
+                    output: format!("stop failed: {}", stop.output),
+                };
+            }
+
+            // 3. Remove the container
+            let rm = run_command("docker", &["rm", container]).await;
+            if !rm.ok {
+                return ToolResult {
+                    ok: false,
+                    output: format!("rm failed (container may still be present): {}", rm.output),
+                };
+            }
+
+            // 4. Re-create: build a new docker run command
+            // Read current .env for fresh env vars
+            let compose_dir = env::var("COMPOSE_DIR").unwrap_or_else(|_| COMPOSE_DIR.to_string());
+            let env_path = format!("{}/.env", compose_dir);
+            let current_env: std::collections::HashMap<String, String> =
+                tokio::fs::read_to_string(&env_path)
+                    .await
+                    .map(|content| {
+                        content
+                            .lines()
+                            .filter_map(|line| {
+                                let line = line.trim();
+                                if line.is_empty() || line.starts_with('#') {
+                                    return None;
+                                }
+                                line.split_once('=').map(|(k, v)| {
+                                    (k.to_string(), v.to_string())
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+            // Start with current .env vars, overlay the original container's env
+            // vars (which may include DOCKER_-created entries not in .env)
+            let current_env_count = current_env.len();
+            let mut final_env: std::collections::HashMap<String, String> = current_env;
+            for env_line in &cfg.env {
+                if let Some((k, v)) = env_line.split_once('=') {
+                    final_env.insert(k.to_string(), v.to_string());
+                }
+            }
+
+            // Build args: docker run [image]
+            let mut args: Vec<String> = vec!["run".to_string(), "-d".to_string(), "--name".to_string(), container.to_string()];
+
+            // Re-attach ports from HostConfig.PortBindings
+            if let Some(port_bindings) = cfg
+                .host_config
+                .get("PortBindings")
+                .and_then(|pb| pb.as_object())
+            {
+                for (container_port, host_binding) in port_bindings {
+                    if let Some(bindings) = host_binding.as_array() {
+                        for binding in bindings {
+                            let _host_ip = binding
+                                .get("HostIp")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("0.0.0.0");
+                            let host_port = binding
+                                .get("HostPort")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("0");
+                            args.push(format!("-p{}:{}", host_port, container_port));
+                        }
+                    }
+                }
+            }
+
+            // Re-attach volumes from HostConfig.Binds
+            if let Some(binds) = cfg
+                .host_config
+                .get("Binds")
+                .and_then(|b| b.as_array())
+            {
+                for bind in binds {
+                    if let Some(vol) = bind.as_str() {
+                        args.push(format!("-v={}", vol));
+                    }
+                }
+            }
+
+            // Add env vars
+            for (key, val) in &final_env {
+                args.push(format!("-e{}={}", key, val));
+            }
+
+            args.push(cfg.image.clone());
+
+            let run_result = Command::new("docker")
+                .args(&args)
+                .output()
+                .await;
+
+            match run_result {
+                Ok(out) if out.status.success() => {
+                    ToolResult {
+                        ok: true,
+                        output: format!(
+                            "container recreated successfully.\n\
+                            Image: {}\n\
+                            Env vars applied from {} ({} vars from .env, {} extra from original container)\n\
+                            Run command: docker {}\n\
+                            Container output: {}",
+                            cfg.image,
+                            env_path,
+                            current_env_count,
+                            cfg.env.len() - current_env_count,
+                            args.join(" "),
+                            String::from_utf8_lossy(&out.stdout).trim()
+                        ),
+                    }
+                }
+                Ok(out) => ToolResult {
+                    ok: false,
+                    output: format!(
+                        "container stopped and removed but failed to re-create:\n{}\n\
+                        Container is now gone — you need to manually run:\n\
+                        docker {}\n\
+                        Error: {}",
+                        String::from_utf8_lossy(&out.stderr),
+                        args.join(" "),
+                        String::from_utf8_lossy(&out.stdout)
+                    ),
+                },
+                Err(e) => ToolResult {
+                    ok: false,
+                    output: format!(
+                        "container stopped and removed but failed to spawn docker run: {e}\n\
+                        You need to manually re-create the container."
+                    ),
+                },
+            }
         }
 
         // env_get { "container": "vikunja", "filter": "VIKUNJA" }
