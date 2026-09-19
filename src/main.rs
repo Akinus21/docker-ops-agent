@@ -763,24 +763,17 @@ reload output: {}", reload.output),
                 host_config: serde_json::Value,
             }
 
-            let inspect_list: Vec<ContainerInspect> = match serde_json::from_str(&inspect.output) {
+            // docker inspect returns a single object {Config: {...}, HostConfig: {...}, ...}
+            let inspect_obj: ContainerInspect = match serde_json::from_str(&inspect.output) {
                 Ok(c) => c,
                 Err(e) => {
                     return ToolResult {
                         ok: false,
-                        output: format!("failed to parse docker inspect JSON (not an array?): {e} — output was: {}", inspect.output),
+                        output: format!("failed to parse docker inspect JSON: {e} — output was: {}", inspect.output),
                     };
                 }
             };
-            let cfg = match inspect_list.into_iter().next() {
-                Some(c) => c.config,
-                None => {
-                    return ToolResult {
-                        ok: false,
-                        output: "docker inspect returned empty array — container may be gone".into(),
-                    };
-                }
-            };
+            let cfg = inspect_obj.config;
 
             // 2. Stop the container
             let stop = run_command("docker", &["stop", container]).await;
