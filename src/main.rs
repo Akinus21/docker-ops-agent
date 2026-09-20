@@ -749,6 +749,8 @@ reload output: {}", reload.output),
             struct ContainerInspect {
                 #[serde(rename = "Config")]
                 config: ContainerConfig,
+                #[serde(rename = "HostConfig")]
+                host_config: serde_json::Value,
             }
 
             #[derive(serde::Deserialize)]
@@ -760,8 +762,6 @@ reload output: {}", reload.output),
                 #[serde(rename = "ExposedPorts", default)]
                 #[allow(dead_code)]
                 exposed_ports: Option<serde_json::Value>,
-                #[serde(rename = "HostConfig")]
-                host_config: serde_json::Value,
             }
 
             // docker inspect returns a single object {Config: {...}, HostConfig: {...}, ...}
